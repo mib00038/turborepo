@@ -943,15 +943,33 @@ fn create_temporary_symlink(parent_fd: i32, target: &CString) -> io::Result<CStr
     ))
 }
 
+/// Prefix of the names a restore stages beside each destination before the
+/// final rename.
+const TEMPORARY_PREFIX: &str = ".turbo-restore-";
+
 #[cfg(any(unix, windows))]
 fn temporary_basename() -> String {
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
     format!(
-        ".turbo-restore-{}-{}",
+        "{TEMPORARY_PREFIX}{}-{}",
         std::process::id(),
         NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Whether `file_name` has the shape of a staged restore file,
+/// `.turbo-restore-<pid>-<counter>`. A restore killed before its rename
+/// leaves that file beside its destination, where output globs match it.
+pub fn is_restore_temporary(file_name: &str) -> bool {
+    file_name
+        .strip_prefix(TEMPORARY_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, counter)| is_decimal(pid) && is_decimal(counter))
+}
+
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(unix)]

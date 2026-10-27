@@ -1,4 +1,8 @@
-use std::{backtrace::Backtrace, collections::HashMap, io::Read};
+use std::{
+    backtrace::Backtrace,
+    collections::HashMap,
+    io::{self, Read},
+};
 
 use petgraph::graph::DiGraph;
 use sha2::{Digest, Sha512};
@@ -8,7 +12,9 @@ use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPathBuf
 use crate::{
     CacheError,
     cache_archive::{
-        restore_directory::{CachedDirTree, restore_directory, validate_restore_path},
+        restore_directory::{
+            CachedDirTree, is_restore_temporary, restore_directory, validate_restore_path,
+        },
         restore_manifest::RestoreManifest,
         restore_regular::{RegularRestore, restore_regular},
         restore_symlink::{
@@ -96,6 +102,17 @@ impl<'a> CacheReader<'a> {
 
         for entry in tr.entries()? {
             let mut entry = entry?;
+            // An archive written before staged names were filtered out of
+            // outputs may carry one, and it is not an output: it is neither
+            // written nor recorded.
+            if is_staged_restore_file(&entry)? {
+                tracing::debug!(
+                    "skipping staged restore file {:?} in the archive",
+                    entry.path()?
+                );
+                io::copy(&mut entry, &mut io::sink())?;
+                continue;
+            }
             match restore_entry(&mut dir_cache, anchor, &mut entry, previous_manifest) {
                 Err(CacheError::LinkTargetDoesNotExist(_, _)) => {
                     symlinks.push(entry);
@@ -209,6 +226,22 @@ fn restore_entry<T: Read>(
             Backtrace::capture(),
         )),
     }
+}
+
+/// Whether `entry` is a regular file or symlink a killed restore left staged.
+/// Its path is validated first, so a malformed path fails as for every entry;
+/// a staged entry with a valid path skips the other checks and is not written.
+fn is_staged_restore_file<T: Read>(entry: &Entry<T>) -> Result<bool, CacheError> {
+    let processed_name = AnchoredSystemPathBuf::from_system_path(&entry.path()?)?;
+    validate_restore_path(&processed_name)?;
+    Ok(matches!(
+        entry.header().entry_type(),
+        tar::EntryType::Regular | tar::EntryType::Symlink
+    ) && processed_name
+        .as_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_restore_temporary))
 }
 
 /// Records a symlink the restore just wrote, with the target it was written
@@ -2009,6 +2042,113 @@ mod tests {
 
             Ok(())
         }
+    }
+
+    #[test]
+    fn restore_temporary_names_have_a_pid_and_a_counter() {
+        use crate::cache_archive::is_restore_temporary;
+
+        assert!(is_restore_temporary(".turbo-restore-4242-0"));
+        assert!(!is_restore_temporary(".turbo-restore-4242"));
+        assert!(!is_restore_temporary(".turbo-restore-4242-"));
+        assert!(!is_restore_temporary(".turbo-restore-build-0"));
+        assert!(!is_restore_temporary(".turbo-restore-notes"));
+        assert!(!is_restore_temporary("turbo-restore-4242-0"));
+        assert!(!is_restore_temporary(".turbo-restore-+12-0"));
+        assert!(!is_restore_temporary(".turbo-restore--0"));
+        assert!(!is_restore_temporary(".turbo-restore-1-2-3"));
+    }
+
+    #[test]
+    fn restore_skips_staged_files_carried_by_the_archive() -> Result<()> {
+        let tar = generate_raw_tar(&[
+            RawTarEntry::Directory { path: "dist" },
+            RawTarEntry::File {
+                path: "dist/.turbo-restore-4242-0",
+                body: b"partial".to_vec(),
+            },
+            RawTarEntry::File {
+                path: "dist/output",
+                body: b"restored".to_vec(),
+            },
+            RawTarEntry::Symlink {
+                link_path: "dist/.turbo-restore-4242-1",
+                link_target: "output",
+            },
+        ]);
+        let output_dir = tempdir()?;
+        let anchor = AbsoluteSystemPathBuf::try_from(output_dir.path())?;
+        let mut reader = CacheReader::from_reader(&tar[..], false)?;
+        let (restored, _) = reader.restore(&anchor, None)?;
+
+        let restored: Vec<String> = restored
+            .iter()
+            .map(|path| path.to_unix().into_inner())
+            .collect();
+        assert!(restored.contains(&"dist/output".to_string()));
+        assert!(!restored.contains(&"dist/.turbo-restore-4242-0".to_string()));
+        assert!(!restored.contains(&"dist/.turbo-restore-4242-1".to_string()));
+        let dist = anchor.join_component("dist");
+        assert!(!dist.join_component(".turbo-restore-4242-0").exists());
+        assert!(
+            dist.join_component(".turbo-restore-4242-1")
+                .symlink_metadata()
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(dist.join_component("output").as_path())?,
+            "restored"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_a_staged_name_outside_the_anchor() -> Result<()> {
+        let tar = generate_raw_tar_with_unsafe_path("../.turbo-restore-1-0", b"");
+        let output_dir = tempdir()?;
+        let anchor = AbsoluteSystemPathBuf::try_from(output_dir.path())?;
+        let mut reader = CacheReader::from_reader(&tar[..], false)?;
+
+        let result = reader.restore(&anchor, None);
+        assert!(
+            matches!(
+                result,
+                Err(crate::CacheError::PathError(
+                    turbopath::PathError::MalformedPath(_),
+                    _
+                ))
+            ),
+            "a staged name outside the anchor should be rejected, got: {result:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_an_unsupported_entry_with_a_staged_name() -> Result<()> {
+        let mut tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Fifo);
+            header.set_size(0);
+            builder.append_data(&mut header, "dist/.turbo-restore-1-0", empty())?;
+            builder.finish()?;
+        }
+        let output_dir = tempdir()?;
+        let anchor = AbsoluteSystemPathBuf::try_from(output_dir.path())?;
+        let mut reader = CacheReader::from_reader(&tar[..], false)?;
+
+        assert!(matches!(
+            reader.restore(&anchor, None),
+            Err(crate::CacheError::RestoreUnsupportedFileType(
+                tar::EntryType::Fifo,
+                _
+            ))
+        ));
+
+        Ok(())
     }
 
     #[cfg(unix)]

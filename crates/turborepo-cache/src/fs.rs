@@ -954,6 +954,53 @@ mod test {
         Ok(())
     }
 
+    /// An archive written before staged restore files were filtered out of
+    /// outputs may carry one; `put` does not filter, so it writes such an
+    /// archive here.
+    #[tokio::test]
+    async fn test_fetch_skips_staged_files_carried_by_the_archive() -> Result<()> {
+        let repo_root = tempdir()?;
+        let repo_root_path = AbsoluteSystemPath::from_std_path(repo_root.path())?;
+        let dist = repo_root_path.join_component("dist");
+        dist.create_dir_all()?;
+        dist.join_component("output.txt")
+            .create_with_contents("output")?;
+        dist.join_component(".turbo-restore-4242-0")
+            .create_with_contents("partial")?;
+
+        let output = AnchoredSystemPathBuf::from_raw(
+            ["dist", "output.txt"].join(std::path::MAIN_SEPARATOR_STR),
+        )?;
+        let staged = AnchoredSystemPathBuf::from_raw(
+            ["dist", ".turbo-restore-4242-0"].join(std::path::MAIN_SEPARATOR_STR),
+        )?;
+        let hash = "staged_restore_file";
+        let cache = FSCache::new(
+            Utf8Path::new("cache"),
+            repo_root_path,
+            None,
+            LazyScmState::resolved(None),
+        )?;
+        cache.put(repo_root_path, hash, &[output.clone(), staged.clone()], 100)?;
+
+        dist.remove_dir_all()?;
+        let (_, restored) = cache
+            .fetch(repo_root_path, hash)?
+            .expect("the archive restores");
+        assert!(restored.contains(&output));
+        assert!(!restored.contains(&staged));
+        assert!(!repo_root_path.resolve(&staged).exists());
+
+        // The restore manifest matches the restored tree, so the next lookup
+        // takes the fast path instead of restoring again.
+        assert!(matches!(
+            cache.lookup(repo_root_path, hash, u64::MAX)?,
+            LocalLookup::Unchanged(..)
+        ));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_fs_cache_writes_scm_metadata() -> Result<()> {
         let repo_root = tempdir()?;

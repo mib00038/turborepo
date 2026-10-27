@@ -22,7 +22,8 @@ use turbopath::{
     AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPath, AnchoredSystemPathBuf,
 };
 use turborepo_cache::{
-    AsyncCache, CacheError, CacheHitMetadata, CacheOpts, CacheSource, http::UploadMap,
+    AsyncCache, CacheError, CacheHitMetadata, CacheOpts, CacheSource,
+    cache_archive::is_restore_temporary, http::UploadMap,
 };
 use turborepo_hash::{FileHashes, TurboHash};
 use turborepo_repository::package_graph::PackageTaskContext;
@@ -803,6 +804,11 @@ impl TaskCache {
             .into_iter()
             .chain(followed_outputs.iter().cloned())
             .collect::<HashSet<_>>();
+
+        // A restore killed before its rename leaves the file it was staging
+        // beside its destination. It is not an output, and archiving it would
+        // hand it to every later restore of this hash.
+        files_to_be_cached.retain(|path| !path.file_name().is_some_and(is_restore_temporary));
 
         // Broad user output globs must not bundle a peer's managed task log,
         // including through an output-directory symlink. Only followed outputs
@@ -1910,6 +1916,50 @@ mod test {
         .unwrap();
 
         assert!(task_cache.expanded_outputs().contains(&expected));
+    }
+
+    #[tokio::test]
+    async fn save_outputs_skips_staged_files_of_killed_restores() {
+        let temp = tempdir().unwrap();
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("dist")).unwrap();
+        std::fs::write(repo_dir.join("dist/output.txt"), b"output").unwrap();
+        std::fs::write(repo_dir.join("dist/.turbo-restore-4242-0"), b"partial").unwrap();
+        let repo_root = AbsoluteSystemPathBuf::try_from(repo_dir.as_path()).unwrap();
+        let mut task_cache = task_cache_for_outputs(&repo_root, vec!["dist/**".to_string()]);
+        let telemetry = PackageTaskEventBuilder::new("pkg", "build");
+
+        task_cache
+            .save_outputs(Duration::from_millis(10), &telemetry)
+            .await
+            .unwrap();
+        task_cache.run_cache.cache.wait().await.unwrap();
+
+        let output = AnchoredSystemPathBuf::from_raw(format!(
+            "dist{}output.txt",
+            std::path::MAIN_SEPARATOR_STR
+        ))
+        .unwrap();
+        let staged = AnchoredSystemPathBuf::from_raw(format!(
+            "dist{}.turbo-restore-4242-0",
+            std::path::MAIN_SEPARATOR_STR
+        ))
+        .unwrap();
+        assert!(task_cache.expanded_outputs().contains(&output));
+        assert!(!task_cache.expanded_outputs().contains(&staged));
+
+        // The archive must not carry it to the next restore either.
+        repo_root.join_component("dist").remove_dir_all().unwrap();
+        let (_, restored) = task_cache
+            .run_cache
+            .cache
+            .fetch(&repo_root, "test-hash")
+            .await
+            .unwrap()
+            .expect("the saved archive restores");
+        assert!(restored.contains(&output));
+        assert!(!restored.contains(&staged));
+        assert!(!repo_root.resolve(&staged).exists());
     }
 
     #[tokio::test]
